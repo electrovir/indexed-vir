@@ -1,5 +1,6 @@
+// cspell:word keyvaluepairs
 import {assert} from '@augment-vir/assert';
-import {randomString} from '@augment-vir/common';
+import {randomString, type PartialWithUndefined} from '@augment-vir/common';
 import {describe, it} from '@augment-vir/test';
 import {defineShape} from 'object-shape-tester';
 import {Store} from './store.js';
@@ -9,6 +10,19 @@ import {toError} from './util/to-error.js';
 class TestStore extends Store {
     public addOnce(key: string, value: unknown) {
         return this.run('readwrite', (store) => store.add(value, key));
+    }
+
+    /** Opens the database at an explicit version, bypassing the version-less attach. */
+    public openAtVersion(version: number) {
+        return this.openDatabase(version);
+    }
+
+    /**
+     * Closes the underlying database while leaving the cached connection in place, imitating a
+     * connection that was closed by a `versionchange` from elsewhere.
+     */
+    public async closeWithoutClearingCache(): Promise<void> {
+        (await this.connect()).close();
     }
 }
 
@@ -20,7 +34,33 @@ function createUniqueName(): string {
 function deleteDatabaseByName(name: string): Promise<void> {
     return new Promise((resolve, reject) => {
         const request = indexedDB.deleteDatabase(name);
+        request.onblocked = () => reject(new Error(`Deleting database '${name}' was blocked.`));
         request.onsuccess = () => resolve();
+        request.onerror = () => reject(toError(request.error));
+    });
+}
+
+/**
+ * Opens a database directly, without going through a {@link Store}, to imitate another tab or
+ * library using the same database. Rejects rather than hanging when an open {@link Store} connection
+ * refuses to yield.
+ */
+function openRawDatabase({
+    name,
+    version,
+    objectStoreName,
+}: Readonly<
+    {name: string} & PartialWithUndefined<{version: number; objectStoreName: string}>
+>): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+        const request = version == undefined ? indexedDB.open(name) : indexedDB.open(name, version);
+        request.onupgradeneeded = () => {
+            if (objectStoreName) {
+                request.result.createObjectStore(objectStoreName);
+            }
+        };
+        request.onblocked = () => reject(new Error(`Opening database '${name}' was blocked.`));
+        request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(toError(request.error));
     });
 }
@@ -462,22 +502,165 @@ describe(Store.name, () => {
             }
         });
 
-        it('rejects when the database cannot be opened', async () => {
+        it('rejects when the database cannot be opened at the requested version', async () => {
             const name = createUniqueName();
-            const higherVersion = await new Promise<IDBDatabase>((resolve, reject) => {
-                const open = indexedDB.open(name, 2);
-                open.onsuccess = () => resolve(open.result);
-                open.onerror = () => reject(toError(open.error));
+            const existing = await openRawDatabase({
+                name,
+                version: 3,
             });
-            higherVersion.close();
+            existing.close();
 
-            const store = new Store(name);
+            const store = new TestStore(name);
             try {
-                await assert.throws(() => store.size(), {
+                /** Opening below the current version is a `VersionError`. */
+                await assert.throws(() => store.openAtVersion(1), {
                     matchConstructor: Error,
                 });
             } finally {
                 await deleteDatabaseByName(name);
+            }
+        });
+    });
+
+    describe('sharing a database with other connections', () => {
+        it('attaches to a database that is already at a higher version', async () => {
+            const name = createUniqueName();
+            const existing = await openRawDatabase({
+                name,
+                version: 5,
+            });
+            existing.close();
+
+            const store = new Store(name);
+            try {
+                await store.setItem('key', 'value');
+                assert.strictEquals(await store.getItem('key'), 'value');
+            } finally {
+                await deleteDatabaseByName(name);
+            }
+        });
+
+        it('adds its object store without disturbing a foreign object store', async () => {
+            const name = createUniqueName();
+            const foreignObjectStoreName = 'foreign-object-store';
+            const foreign = await openRawDatabase({
+                name,
+                version: 1,
+                objectStoreName: foreignObjectStoreName,
+            });
+            foreign.close();
+
+            const store = new Store(name);
+            try {
+                await store.setItem('key', 'value');
+                assert.strictEquals(await store.getItem('key'), 'value');
+
+                const reopened = await openRawDatabase({
+                    name,
+                });
+                assert.deepEquals(
+                    Array.from(reopened.objectStoreNames).toSorted(),
+                    [
+                        foreignObjectStoreName,
+                        store.objectStoreName,
+                    ].toSorted(),
+                );
+                reopened.close();
+            } finally {
+                await deleteDatabaseByName(name);
+            }
+        });
+
+        it('yields to another connection upgrading the database', async () => {
+            const name = createUniqueName();
+            const store = new Store(name);
+            try {
+                await store.setItem('key', 'value');
+
+                /** Blocks forever if the store's open connection does not close itself. */
+                const upgraded = await openRawDatabase({
+                    name,
+                    version: 100,
+                });
+                assert.strictEquals(upgraded.version, 100);
+                upgraded.close();
+
+                assert.strictEquals(await store.getItem('key'), 'value');
+            } finally {
+                await deleteDatabaseByName(name);
+            }
+        });
+
+        it('lets another connection add its own object store while connected', async () => {
+            const name = createUniqueName();
+            const foreignObjectStoreName = 'keyvaluepairs';
+            const store = new Store(name);
+            try {
+                await store.setItem('key', 'value');
+
+                /**
+                 * Adding an object store requires a version bump, which blocks forever if the
+                 * store's open connection does not close itself.
+                 */
+                const foreign = await openRawDatabase({
+                    name,
+                    version: 2,
+                    objectStoreName: foreignObjectStoreName,
+                });
+                assert.deepEquals(
+                    Array.from(foreign.objectStoreNames).toSorted(),
+                    [
+                        foreignObjectStoreName,
+                        store.objectStoreName,
+                    ].toSorted(),
+                );
+                foreign.close();
+
+                assert.strictEquals(await store.getItem('key'), 'value');
+            } finally {
+                await deleteDatabaseByName(name);
+            }
+        });
+
+        it('yields to another connection deleting the database', async () => {
+            const name = createUniqueName();
+            const store = new Store(name);
+            try {
+                await store.setItem('key', 'value');
+
+                /** Blocks forever if the store's open connection does not close itself. */
+                await deleteDatabaseByName(name);
+
+                assert.isUndefined(await store.getItem('key'));
+            } finally {
+                await deleteDatabaseByName(name);
+            }
+        });
+
+        it('reconnects when the cached connection has been closed', async () => {
+            const store = new TestStore(createUniqueName());
+            try {
+                await store.setItem('key', 'value');
+                await store.closeWithoutClearingCache();
+                assert.strictEquals(await store.getItem('key'), 'value');
+            } finally {
+                await store.deleteDatabase();
+            }
+        });
+
+        it('reconnects during iterate when the cached connection has been closed', async () => {
+            const store = new TestStore(createUniqueName());
+            try {
+                await store.setItem('key', 'value');
+                await store.closeWithoutClearingCache();
+
+                const seen: unknown[] = [];
+                await store.iterate((value) => {
+                    seen.push(value);
+                });
+                assert.deepEquals(seen, ['value']);
+            } finally {
+                await store.deleteDatabase();
             }
         });
     });

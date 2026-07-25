@@ -35,18 +35,74 @@ export class Store {
 
     /**
      * Opens (or reuses) the connection to the underlying IndexedDB database, creating the object
-     * store on first connection.
+     * store if it isn't there yet.
      */
     protected connect(): Promise<IDBDatabase> {
         if (!this.connection) {
-            this.connection = new Promise((resolve, reject) => {
-                const open = indexedDB.open(this.storeName, 1);
-                open.onupgradeneeded = () => open.result.createObjectStore(this.objectStoreName);
-                open.onsuccess = () => resolve(open.result);
-                open.onerror = () => reject(toError(open.error));
-            });
+            this.connection = this.openWithObjectStore();
         }
         return this.connection;
+    }
+
+    /**
+     * Opening without a version attaches to an existing database at whatever version it already
+     * has, so a database created by another connection is never rejected for having the "wrong"
+     * version. The object store is then added with the smallest possible version bump, which leaves
+     * any object stores belonging to other connections intact.
+     */
+    protected async openWithObjectStore(): Promise<IDBDatabase> {
+        const existing = await this.openDatabase();
+        if (existing.objectStoreNames.contains(this.objectStoreName)) {
+            return existing;
+        }
+
+        const upgradeVersion = existing.version + 1;
+        existing.close();
+        return await this.openDatabase(upgradeVersion);
+    }
+
+    /** Opens the database at the given version, or at its current version when omitted. */
+    protected openDatabase(version?: number): Promise<IDBDatabase> {
+        return new Promise((resolve, reject) => {
+            const open =
+                version == undefined
+                    ? indexedDB.open(this.storeName)
+                    : indexedDB.open(this.storeName, version);
+            open.onupgradeneeded = () => open.result.createObjectStore(this.objectStoreName);
+            open.onsuccess = () => resolve(this.yieldOnVersionChange(open.result));
+            open.onerror = () => reject(toError(open.error));
+        });
+    }
+
+    /**
+     * An open connection blocks every other connection's upgrade and delete requests until it
+     * closes, so close as soon as one of them asks for it. Dropping the cached connection lets the
+     * next operation transparently reopen.
+     */
+    protected yieldOnVersionChange(database: IDBDatabase): IDBDatabase {
+        database.onversionchange = () => {
+            database.close();
+            this.connection = undefined;
+        };
+        return database;
+    }
+
+    /**
+     * Starts a transaction on the object store, reconnecting once if the cached connection has been
+     * closed by {@link Store.yieldOnVersionChange} since it was opened.
+     */
+    protected async openObjectStore(mode: IDBTransactionMode): Promise<IDBObjectStore> {
+        const database = await this.connect();
+        try {
+            return database
+                .transaction(this.objectStoreName, mode)
+                .objectStore(this.objectStoreName);
+        } catch {
+            this.connection = undefined;
+            return (await this.connect())
+                .transaction(this.objectStoreName, mode)
+                .objectStore(this.objectStoreName);
+        }
     }
 
     /**
@@ -57,12 +113,7 @@ export class Store {
         mode: IDBTransactionMode,
         buildRequest: (store: IDBObjectStore) => IDBRequest<T>,
     ): Promise<T> {
-        const db = await this.connect();
-        return req(
-            buildRequest(
-                db.transaction(this.objectStoreName, mode).objectStore(this.objectStoreName),
-            ),
-        );
+        return req(buildRequest(await this.openObjectStore(mode)));
     }
 
     /** Reads the value stored at `key`, or `undefined` if nothing is stored there. */
@@ -184,11 +235,7 @@ export class Store {
          */
         fn: (value: unknown, key: string, index: number) => U,
     ): Promise<U | undefined> {
-        const db = await this.connect();
-        const cursorRequest = db
-            .transaction(this.objectStoreName, 'readonly')
-            .objectStore(this.objectStoreName)
-            .openCursor();
+        const cursorRequest = (await this.openObjectStore('readonly')).openCursor();
         return new Promise((resolve, reject) => {
             let index = 0;
             cursorRequest.onsuccess = () => {
