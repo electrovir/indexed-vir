@@ -114,7 +114,12 @@ describe(Store.name, () => {
 
     it('stores various value types', async () => {
         await withStore(async (store) => {
-            const date = new Date(0);
+            const map = new Map([
+                [
+                    'a',
+                    1,
+                ],
+            ]);
             await store.setItem(
                 'array',
                 [
@@ -132,7 +137,7 @@ describe(Store.name, () => {
                     ],
                 },
             });
-            await store.setItem('date', date);
+            await store.setItem('map', map);
             assert.deepEquals(
                 await store.getItem('array'),
                 [
@@ -150,7 +155,7 @@ describe(Store.name, () => {
                     ],
                 },
             });
-            assert.deepEquals(await store.getItem('date'), date);
+            assert.deepEquals(await store.getItem('map'), map);
         });
     });
 
@@ -407,7 +412,11 @@ describe(Store.name, () => {
         it('can be destroyed before any other use', async () => {
             const store = new Store(createUniqueName());
             await store.destroy();
-            await store.deleteDatabase();
+            try {
+                assert.strictEquals(await store.size(), 0);
+            } finally {
+                await store.deleteDatabase();
+            }
         });
 
         it('deletes the database and all of its data', async () => {
