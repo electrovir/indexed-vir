@@ -24,6 +24,38 @@ class TestStore extends Store {
     public async closeWithoutClearingCache(): Promise<void> {
         (await this.connect()).close();
     }
+
+    /** Exposes the cached connection, opening one when there isn't one yet. */
+    public open(): Promise<IDBDatabase> {
+        return this.connect();
+    }
+
+    /** Drops the cached connection without closing it, so the next open replaces it. */
+    public dropCache(): void {
+        this.connection = undefined;
+    }
+
+    public get hasCachedConnection(): boolean {
+        return !!this.connection;
+    }
+
+    /** How many transactions {@link TestStore.putAbortingFirstAttempt} has started. */
+    public putAttempts = 0;
+
+    /**
+     * Writes `value` at `key`, aborting the first attempt's transaction to imitate a connection
+     * lost while the transaction was in flight.
+     */
+    public putAbortingFirstAttempt(key: string, value: unknown) {
+        return this.run('readwrite', (objectStore) => {
+            const request = objectStore.put(value, key);
+            this.putAttempts++;
+            if (this.putAttempts === 1) {
+                objectStore.transaction.abort();
+            }
+            return request;
+        });
+    }
 }
 
 function createUniqueName(): string {
@@ -659,6 +691,50 @@ describe(Store.name, () => {
                     seen.push(value);
                 });
                 assert.deepEquals(seen, ['value']);
+            } finally {
+                await store.deleteDatabase();
+            }
+        });
+
+        it('reopens after the browser closes the connection', async () => {
+            const store = new TestStore(createUniqueName());
+            try {
+                await store.setItem('key', 'value');
+
+                const connection = await store.open();
+                connection.close();
+                /** Browsers fire `close` when they tear a connection down on their own. */
+                connection.dispatchEvent(new Event('close'));
+
+                assert.isFalse(store.hasCachedConnection);
+                assert.strictEquals(await store.getItem('key'), 'value');
+            } finally {
+                await store.deleteDatabase();
+            }
+        });
+
+        it('keeps the current connection when a replaced one closes', async () => {
+            const store = new TestStore(createUniqueName());
+            try {
+                const replaced = await store.open();
+                store.dropCache();
+                const current = await store.open();
+
+                /** The replaced connection is still open and fires its handlers too late to matter. */
+                replaced.dispatchEvent(new Event('versionchange'));
+
+                assert.strictEquals(await store.open(), current);
+            } finally {
+                await store.deleteDatabase();
+            }
+        });
+
+        it('retries once when the connection is lost mid-transaction', async () => {
+            const store = new TestStore(createUniqueName());
+            try {
+                assert.strictEquals(await store.putAbortingFirstAttempt('key', 'value'), 'key');
+                assert.strictEquals(store.putAttempts, 2);
+                assert.strictEquals(await store.getItem('key'), 'value');
             } finally {
                 await store.deleteDatabase();
             }

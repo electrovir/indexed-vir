@@ -1,4 +1,5 @@
 import {assertValidShape, type RuntimeTypeOf, type Shape} from 'object-shape-tester';
+import {isTransactionAborted} from './util/is-transaction-aborted.js';
 import {toError} from './util/to-error.js';
 
 function req<T>(request: IDBRequest<T>): Promise<T> {
@@ -39,7 +40,10 @@ export class Store {
      */
     protected connect(): Promise<IDBDatabase> {
         if (!this.connection) {
-            this.connection = this.openWithObjectStore();
+            const attempt: Promise<IDBDatabase> = this.openWithObjectStore().then((database) =>
+                this.yieldOnConnectionLoss(database, attempt),
+            );
+            this.connection = attempt;
         }
         return this.connection;
     }
@@ -69,27 +73,48 @@ export class Store {
                     ? indexedDB.open(this.storeName)
                     : indexedDB.open(this.storeName, version);
             open.onupgradeneeded = () => open.result.createObjectStore(this.objectStoreName);
-            open.onsuccess = () => resolve(this.yieldOnVersionChange(open.result));
+            open.onsuccess = () => resolve(open.result);
             open.onerror = () => reject(toError(open.error));
         });
     }
 
     /**
-     * An open connection blocks every other connection's upgrade and delete requests until it
-     * closes, so close as soon as one of them asks for it. Dropping the cached connection lets the
-     * next operation transparently reopen.
+     * Watches for the two ways a cached connection stops being usable, dropping it from the cache
+     * so that the next operation transparently reopens:
+     *
+     * - `versionchange`: another connection wants to upgrade or delete the database and is blocked
+     *   until every other connection closes, so close as soon as it asks. An explicit `close()`
+     *   does not fire `close`, hence forgetting here too.
+     * - `close`: the browser closed the connection on its own, which it does when tearing down the
+     *   page or when the storage backing the database goes away.
      */
-    protected yieldOnVersionChange(database: IDBDatabase): IDBDatabase {
+    protected yieldOnConnectionLoss(
+        database: IDBDatabase,
+        /** The cache entry this connection belongs to. */
+        attempt: Promise<IDBDatabase>,
+    ): IDBDatabase {
         database.onversionchange = () => {
             database.close();
-            this.connection = undefined;
+            this.forget(attempt);
         };
+        database.onclose = () => this.forget(attempt);
         return database;
     }
 
     /**
-     * Starts a transaction on the object store, reconnecting once if the cached connection has been
-     * closed by {@link Store.yieldOnVersionChange} since it was opened.
+     * Drops the given connection from the cache. A connection that has already been replaced fires
+     * its close handlers too late to matter, and must not discard its replacement.
+     */
+    protected forget(attempt: Promise<IDBDatabase>): void {
+        if (this.connection === attempt) {
+            this.connection = undefined;
+        }
+    }
+
+    /**
+     * Starts a transaction on the object store, reconnecting once if the cached connection has
+     * closed since it was opened. Reopening is bounded to a single attempt so that a genuinely
+     * unusable IndexedDB, such as one disabled by private browsing, cannot loop here.
      */
     protected async openObjectStore(mode: IDBTransactionMode): Promise<IDBObjectStore> {
         const database = await this.connect();
@@ -108,12 +133,24 @@ export class Store {
     /**
      * Runs the given request factory inside a transaction on the object store and resolves with its
      * result.
+     *
+     * A connection that closes after the transaction has already started aborts it, which
+     * {@link Store.openObjectStore} cannot see coming, so retry that once on a fresh connection. An
+     * aborted transaction rolls back, so the retry cannot apply a write twice.
      */
     protected async run<T>(
         mode: IDBTransactionMode,
         buildRequest: (store: IDBObjectStore) => IDBRequest<T>,
     ): Promise<T> {
-        return req(buildRequest(await this.openObjectStore(mode)));
+        try {
+            return await req(buildRequest(await this.openObjectStore(mode)));
+        } catch (error) {
+            if (!isTransactionAborted(error)) {
+                throw error;
+            }
+            this.connection = undefined;
+            return await req(buildRequest(await this.openObjectStore(mode)));
+        }
     }
 
     /** Reads the value stored at `key`, or `undefined` if nothing is stored there. */
@@ -249,6 +286,10 @@ export class Store {
                 }
                 cursor.continue();
             };
+            /**
+             * Unlike {@link Store.run}, an aborted cursor is not retried: reopening would replay
+             * entries that `fn` has already been called with.
+             */
             /* v8 ignore next 2: a cursor request only errors on transaction abort, which is not reproducible from this API. */
             cursorRequest.onerror = () => reject(toError(cursorRequest.error));
         });
